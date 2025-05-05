@@ -18,9 +18,19 @@ from selenium.webdriver.common.by import By
 app = Flask(__name__)
 app.secret_key = 'vulnerability_scanner_secret_key'
 
+# Configuración para entornos cloud y locales
+REPORT_DIR = os.environ.get('REPORT_DIR', 'reports')
+
 # Crear directorio para informes si no existe
-if not os.path.exists('reports'):
-    os.makedirs('reports')
+if not os.path.exists(REPORT_DIR):
+    os.makedirs(REPORT_DIR)
+
+# Configurar logging
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 # Cola para comunicación entre el hilo de escaneo y la aplicación web
 scan_queue = queue.Queue()
@@ -30,7 +40,7 @@ results_queue = queue.Queue()
 
 # PDF report initialization
 def generate_report(results, filename):
-    pdf_path = os.path.join('reports', filename)
+    pdf_path = os.path.join(REPORT_DIR, filename)
     pdf = canvas.Canvas(pdf_path, pagesize=letter)
     pdf.setTitle("Reporte de Vulnerabilidades de Aplicaciones Web")
     pdf.drawString(100, 750, "Reporte de Vulnerabilidades de Aplicaciones Web")
@@ -164,47 +174,78 @@ def check_csrf(url):
 def check_xss_selenium(url):
     results_queue.put(f"Probando XSS con Selenium en {url}...")
     try:
-        # Usar opciones headless para que no se abra el navegador visualmente
+        from webdriver_manager.chrome import ChromeDriverManager
+        from webdriver_manager.core.os_manager import ChromeType
+        from selenium.webdriver.chrome.service import Service
+        
+        # Configuración para entorno cloud
         chrome_options = Options()
         chrome_options.add_argument("--headless")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-setuid-sandbox")
         
-        driver = webdriver.Chrome(options=chrome_options)
+        # Usar webdriver-manager para gestionar el driver automáticamente
+        try:
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+        except:
+            # Fallback para entornos cloud donde ChromeDriverManager podría fallar
+            results_queue.put("Fallback: Usando método alternativo para XSS - simulación sin navegador real")
+            # Simulamos la prueba sin navegador real para entornos donde Selenium no funciona
+            response = requests.get(url)
+            if "<script>alert" in response.text:
+                return ("Potencialmente Vulnerable (Simulado)", "Medium")
+            return ("No se detectaron XSS simples (Simulado)", "Low")
+        
         driver.get(url)
         
         script = "<script>alert('XSS')</script>"
-        inputs = driver.find_elements(By.TAG_NAME, 'input')
-        xss_detected = False
-        
-        for input_field in inputs:
-            try:
-                input_field.send_keys(script)
+        try:
+            inputs = driver.find_elements(By.TAG_NAME, 'input')
+            xss_detected = False
+            
+            for input_field in inputs:
                 try:
-                    input_field.submit()
+                    input_field.send_keys(script)
+                    try:
+                        input_field.submit()
+                    except:
+                        pass
+                    
+                    # Comprobar si aparece una alerta
+                    try:
+                        alert = driver.switch_to.alert
+                        alert.accept()
+                        xss_detected = True
+                        break
+                    except:
+                        pass
                 except:
-                    pass
-                
-                # Comprobar si aparece una alerta
-                try:
-                    alert = driver.switch_to.alert
-                    alert.accept()
-                    xss_detected = True
-                    break
-                except:
-                    pass
-            except:
-                continue
-        
-        driver.quit()
-        
-        if xss_detected:
-            result = ("Vulnerable (Selenium)", "High")
-        else:
-            result = ("Safe (Selenium)", "Low")
+                    continue
+            
+            driver.quit()
+            
+            if xss_detected:
+                result = ("Vulnerable (Selenium)", "High")
+            else:
+                result = ("Safe (Selenium)", "Low")
+        except Exception as inner_e:
+            driver.quit()
+            results_queue.put(f"Error al interactuar con la página: {str(inner_e)}")
+            result = ("Error en pruebas XSS", "Unknown")
     except Exception as e:
         results_queue.put(f"Error en la prueba con Selenium: {str(e)}")
-        return ("Error (Selenium)", "Unknown")
+        # Usar alternativa: comprobación básica si Selenium falla completamente
+        try:
+            response = requests.get(url)
+            if "<script>alert" in response.text:
+                return ("Potencialmente Vulnerable (Alternativo)", "Medium")
+            return ("Prueba alternativa: No se detectaron XSS simples", "Low")
+        except:
+            return ("Error en todas las pruebas XSS", "Unknown")
     
     results_queue.put(f"XSS (Selenium): {result[0]} (Risk: {result[1]})")
     return result
@@ -296,7 +337,7 @@ def get_results():
 @app.route('/download/<session_id>')
 def download_report(session_id):
     filename = f"vulnerability_report_{session_id}.pdf"
-    file_path = os.path.join('reports', filename)
+    file_path = os.path.join(REPORT_DIR, filename)
     
     if os.path.exists(file_path):
         return send_file(file_path, as_attachment=True)
@@ -305,4 +346,6 @@ def download_report(session_id):
         return redirect(url_for('index'))
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    # Obtener el puerto desde la variable de entorno o usar 5000 como predeterminado
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)

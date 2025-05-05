@@ -4,3 +4,4 @@ reportlab
 selenium
 flask
 gunicorn
+webdriver-manager
